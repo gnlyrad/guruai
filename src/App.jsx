@@ -12,11 +12,57 @@ import {
 
 const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 
-// Fuzzy matching function
-const fuzzyMatch = (ingredient, productName) => {
-  const ingredientWords = ingredient.toLowerCase().split(" ");
-  const productWords = productName.toLowerCase().split(" ");
-  return ingredientWords.some((word) => productWords.includes(word));
+// Define food-related categories
+const FOOD_CATEGORIES = [
+  "Bakery",
+  "Dairy",
+  "Food Cupboard",
+  "Frozen",
+  "Fruits & Vegetables",
+  "Meat & Seafood",
+  "Snacks & Confectionery",
+];
+
+// Special case for Rice category which has a different structure in the data
+const FOOD_SUBCATEGORIES = ["Rice", "Noodles", "Oils & Seasoning", "Baby Food"];
+
+// Advanced fuzzy matching function with category awareness
+const fuzzyMatch = (ingredient, product) => {
+  // First check if product is in a food category
+  const isInFoodCategory =
+    FOOD_CATEGORIES.includes(product.Category) ||
+    FOOD_SUBCATEGORIES.includes(product.Subcategory);
+
+  if (!isInFoodCategory) {
+    return false; // Skip non-food items immediately
+  }
+
+  // Clean and normalize both strings
+  const cleanIngredient = ingredient.toLowerCase().trim();
+  const cleanProductName = product["Product Name"].toLowerCase().trim();
+
+  // Direct match check - if product name contains the exact ingredient name
+  if (cleanProductName.includes(cleanIngredient)) {
+    return true;
+  }
+
+  // Word-by-word matching with higher threshold
+  const ingredientWords = cleanIngredient
+    .split(/\s+/)
+    .filter((word) => word.length > 2);
+
+  // If ingredient is a single word or very short, require stricter matching
+  if (ingredientWords.length <= 1) {
+    return cleanProductName.includes(cleanIngredient);
+  }
+
+  // For multi-word ingredients, check if most significant words are present
+  const significantMatches = ingredientWords.filter((word) =>
+    cleanProductName.includes(word)
+  );
+
+  // Require at least 75% of significant words to match for multi-word ingredients
+  return significantMatches.length >= Math.ceil(ingredientWords.length * 0.75);
 };
 
 // Supermarket Map Component (Highlights Selected Aisles)
@@ -86,7 +132,13 @@ function App() {
 
     const requestBody = {
       contents: [
-        { parts: [{ text: `What ingredients do I need to make ${message}?` }] },
+        {
+          parts: [
+            {
+              text: `What ingredients do I need to make ${message}? Please list only the food ingredients, separated by commas. Do not include kitchen tools, utensils, or non-food items.`,
+            },
+          ],
+        },
       ],
     };
 
@@ -122,6 +174,60 @@ function App() {
     }
   };
 
+  // Helper function to find the best matching products for each ingredient
+  const findBestMatchingProducts = (cleanedIngredients, productList) => {
+    const matchedProductsByIngredient = {};
+
+    // For each ingredient, find all matching products
+    cleanedIngredients.forEach((ingredient) => {
+      const matches = productList.filter((product) =>
+        fuzzyMatch(ingredient, product)
+      );
+
+      if (matches.length > 0) {
+        matchedProductsByIngredient[ingredient] = matches;
+      }
+    });
+
+    // Flatten the matches into a single array, removing duplicates
+    const allMatches = [];
+    const seenProductNames = new Set();
+
+    Object.entries(matchedProductsByIngredient).forEach(
+      ([ingredient, products]) => {
+        products.forEach((product) => {
+          if (!seenProductNames.has(product["Product Name"])) {
+            seenProductNames.add(product["Product Name"]);
+            allMatches.push({
+              ...product,
+              matchedIngredient: ingredient, // Add the matched ingredient for reference
+            });
+          }
+        });
+      }
+    );
+
+    return {
+      allMatches,
+      matchedProductsByIngredient,
+    };
+  };
+
+  // Helper function to categorize products by food category
+  const categorizeProductsByFoodGroup = (products) => {
+    const categorized = {};
+
+    products.forEach((product) => {
+      const category = product.Category;
+      if (!categorized[category]) {
+        categorized[category] = [];
+      }
+      categorized[category].push(product);
+    });
+
+    return categorized;
+  };
+
   const handleSend = async (message) => {
     if (!message.trim()) return;
 
@@ -132,7 +238,8 @@ function App() {
     const suggested = await callGeminiAPI(message);
     console.log("Suggested ingredients:", suggested);
 
-    if (suggested.length === 0) {
+    // Add validation for empty suggestions
+    if (!suggested || suggested.length === 0) {
       setMessages((prevMessages) => [
         ...prevMessages,
         {
@@ -144,19 +251,31 @@ function App() {
       return;
     }
 
-    setSuggestedIngredients(suggested);
-
-    const matchedProducts = products.filter((product) =>
-      suggested.some((ingredient) =>
-        fuzzyMatch(ingredient, product["Product Name"])
+    // Clean Gemini's response
+    const cleanSuggestions = suggested
+      .map((ingredient) =>
+        ingredient
+          .replace(/\d+\.\s*/, "") // Remove numbering
+          .replace(/\(.*?\)/g, "") // Remove parentheses content
+          .trim()
       )
-    );
+      .filter((ingredient) => ingredient.length > 0); // Remove empty strings
 
-    if (matchedProducts.length === 0) {
+    setSuggestedIngredients(cleanSuggestions);
+
+    // Use improved matching logic to find the best matching products
+    const {
+      allMatches,
+      matchedProductsByIngredient,
+    } = findBestMatchingProducts(cleanSuggestions, products);
+
+    if (allMatches.length === 0) {
       setMessages((prevMessages) => [
         ...prevMessages,
         {
-          message: `I found these ingredients for ${message}, but none match your available products.`,
+          message: `I found these ingredients for ${message}, but none match your available products: ${cleanSuggestions.join(
+            ", "
+          )}`,
           sender: "Chatbot",
         },
       ]);
@@ -164,16 +283,34 @@ function App() {
       return;
     }
 
-    setIngredientOptions(matchedProducts);
+    // Group products by matched ingredient for better organization
+    const matchedIngredients = Object.keys(matchedProductsByIngredient);
+    const unmatchedIngredients = cleanSuggestions.filter(
+      (ingredient) => !matchedIngredients.includes(ingredient)
+    );
+
+    // Categorize matched products by food group
+    const categorizedProducts = categorizeProductsByFoodGroup(allMatches);
+
+    setIngredientOptions(allMatches);
     setShowChecklist(true);
     setSelectedItems([]);
+
+    // Create a more informative message about matched and unmatched ingredients
+    let ingredientMessage = `Gemini suggests you need these ingredients: ${cleanSuggestions.join(
+      ", "
+    )}`;
+
+    if (unmatchedIngredients.length > 0) {
+      ingredientMessage += `\n\nI couldn't find matches for: ${unmatchedIngredients.join(
+        ", "
+      )}`;
+    }
 
     setMessages((prevMessages) => [
       ...prevMessages,
       {
-        message: `Gemini suggests you need these ingredients: ${suggested.join(
-          ", "
-        )}`,
+        message: ingredientMessage,
         sender: "Chatbot",
       },
       {
@@ -188,11 +325,11 @@ function App() {
   const handleGetOptimizedRoute = () => {
     if (selectedItems.length === 0) return;
 
-    // Extract aisle numbers from selected items (fixing missing aisle issue)
+    // Extract aisle numbers from selected items
     const aisles = [
       ...new Set(
         selectedItems
-          .map((item) => item["Aisle"])
+          .map((item) => item["Aisle Number"])
           .filter((aisle) => aisle && aisle !== "Not Available")
           .map((aisle) => `Aisle ${aisle}`)
       ),
@@ -263,7 +400,12 @@ function App() {
                         style={{ marginRight: "8px" }}
                       />
                       {product["Product Name"]} - ${product["Price ($)"]}{" "}
-                      (Aisle: {product["Aisle"]})
+                      (Aisle: {product["Aisle Number"]})
+                      {product.matchedIngredient && (
+                        <span style={{ color: "green", marginLeft: "5px" }}>
+                          (Matches: {product.matchedIngredient})
+                        </span>
+                      )}
                     </div>
                   ))}
                   <button onClick={handleGetOptimizedRoute}>
